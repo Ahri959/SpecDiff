@@ -3,9 +3,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ---------------- 复用之前的先进组件 ----------------
+# ---------------- Reuse the Advanced Components Defined Earlier ----------------
 class ResidualUpBlock(nn.Module):
-    """使用 Model A 的残差上采样块"""
+    """Residual upsampling block from Model A."""
 
     def __init__(self, in_ch, out_ch):
         super().__init__()
@@ -30,7 +30,7 @@ class ResidualUpBlock(nn.Module):
 
 
 class ASPP(nn.Module):
-    """使用 Model A 的 ASPP"""
+    """Atrous Spatial Pyramid Pooling module from Model A."""
 
     def __init__(self, in_ch, out_ch, dilations=(1, 6, 12)):
         super().__init__()
@@ -105,7 +105,7 @@ class MultiScaleResidualRefinement(nn.Module):
         return self.fuse(torch.cat([mid, high], dim=1))
 
 
-# ---------------- 融合版主模型 ----------------
+# ---------------- Main Fusion Model ----------------
 class FusionSegHead_Optimized(nn.Module):
     def __init__(
         self,
@@ -118,23 +118,27 @@ class FusionSegHead_Optimized(nn.Module):
         super().__init__()
         self.enable_multiscale_refine = bool(enable_multiscale_refine)
 
-        # 1. 投影层 (SiLU + GroupNorm)
+        # 1. Projection layer (SiLU + GroupNorm)
         self.z_proj = nn.Sequential(
             nn.Conv2d(z_dim, base_channels, 3, padding=1, bias=False),
             nn.GroupNorm(32, base_channels),
             nn.SiLU(inplace=True),
         )
 
-        # f3 投影：假设 f3 通道数很多，先降维
+        # Project f3 to a lower-dimensional representation
+        # because it may contain a large number of channels.
         self.f3_proj = nn.Sequential(
             nn.Conv2d(f3_dim, base_channels, 1, bias=False),
             nn.GroupNorm(32, base_channels),
             nn.SiLU(inplace=True),
         )
 
-        # 2. 融合后的核心处理：使用 ASPP 替代简单的 Conv
-        # 输入通道是 base_channels (如果相加) 或者 2*base_channels (如果Concat)
-        # 建议使用 Concat，虽然显存多一点，但特征保留更完整
+        # 2. Core feature processing after fusion: use ASPP instead of
+        # a simple convolution.
+        # The input channel count is base_channels for element-wise addition
+        # or 2 * base_channels for concatenation.
+        # Concatenation is recommended because it preserves more information,
+        # although it requires slightly more GPU memory.
         self.aspp = ASPP(base_channels * 2, base_channels)
         self.multiscale_refine = (
             MultiScaleResidualRefinement(
@@ -146,27 +150,30 @@ class FusionSegHead_Optimized(nn.Module):
             else None
         )
 
-        # 3. 解码器：使用 ResidualUpBlock
+        # 3. Decoder using ResidualUpBlock
         self.up1 = ResidualUpBlock(base_channels, base_channels // 2)
         self.up2 = ResidualUpBlock(base_channels // 2, base_channels // 4)
-        self.up3 = ResidualUpBlock(base_channels // 4, 32)  # 最后输出 32 通道
+        self.up3 = ResidualUpBlock(base_channels // 4, 32)  # Output 32 channels
 
         # 4. Classifier
         self.classifier = nn.Conv2d(32, num_classes, 1)
 
-        # 初始化 Output bias，防止训练初期 Loss 爆炸
+        # Initialize the output bias to reduce the risk of exploding
+        # loss during the early stages of training.
         nn.init.constant_(self.classifier.bias, -3.0)
 
     def forward(self, z, f3_dict, thermal_emb=None):
-        # 假设 f3 是字典或者是 Tensor
+        # f3 can be either a dictionary or a tensor.
         f3 = f3_dict["mid"] if isinstance(f3_dict, dict) else f3_dict
 
-        # 处理 z
+        # Process z
         z_feat = self.z_proj(z)  # [B, 256, 60, 80]
 
-        # 处理 f3 (对齐到 z 的尺寸)。某些 PyTorch/CUDA 版本不支持
-        # BFloat16 的 bilinear upsample，因此只在插值算子中使用 FP32，
-        # 再交给后续投影层在 autocast 下恢复计算 dtype。
+        # Process f3 and resize it to match the spatial dimensions of z.
+        # Some PyTorch/CUDA versions do not support bilinear upsampling
+        # with BFloat16. Therefore, interpolation is performed in FP32,
+        # after which the subsequent projection layer restores the
+        # computation dtype under autocast.
         f3_feat = F.interpolate(
             f3.float(),
             size=z_feat.shape[2:],
@@ -177,11 +184,13 @@ class FusionSegHead_Optimized(nn.Module):
         if f3_feat.dtype != z_feat.dtype:
             f3_feat = f3_feat.to(dtype=z_feat.dtype)
 
-        # --- 关键改进：Concat 融合 ---
-        # 相比 z + f3，Concat 让网络自己决定用 z 的语义还是 f3 的细节
+        # --- Key improvement: concatenation-based fusion ---
+        # Unlike z + f3, concatenation allows the network to learn
+        # how to balance the semantic information in z against
+        # the fine-grained details in f3.
         x = torch.cat([z_feat, f3_feat], dim=1)  # [B, 512, 60, 80]
 
-        # 核心特征提取
+        # Core feature extraction
         x = self.aspp(x)  # [B, 256, 60, 80]
 
         if self.enable_multiscale_refine:
@@ -197,7 +206,7 @@ class FusionSegHead_Optimized(nn.Module):
             )
             x = x + residual
 
-        # 上采样
+        # Upsampling
         x = self.up1(x)  # -> 120x160
         x = self.up2(x)  # -> 240x320
         x = self.up3(x)  # -> 480x640
