@@ -32,10 +32,10 @@ class ResNet50Splitter(nn.Module):
         return f2  # [B,512,H/8,W/8]
 
     def forward_layer3(self, x):
-        return self.layer3(x)  # 输入 [B,512,...] -> 输出 [B,1024,...]
+        return self.layer3(x)  # Input [B,512,...] -> Output [B,1024,...]
 
     def forward_layer4(self, x):
-        return self.layer4(x)  # 输入 [B,1024,...] -> 输出 [B,2048,...]
+        return self.layer4(x)  # Input [B,1024,...] -> Output [B,2048,...]
 
 
 # ------------------ DeepDecoder ------------------
@@ -123,7 +123,7 @@ class RGBQualityEstimator(nn.Module):
         return delta.view(-1, 1, 1, 1)
 
 
-# ------------------ ResNet_Fuse_L2 (thermal 单通道 专用, 改进版) ------------------
+# ------------------ ResNet_Fuse_L2 (single-channel thermal, improved version) ------------------
 class ResNet_Fuse_L2(nn.Module):
     def __init__(
         self,
@@ -138,9 +138,9 @@ class ResNet_Fuse_L2(nn.Module):
         stage1_ablation_mode="standard",
     ):
         """
-        fuse_channels: 融合时使用的通道数
-        embed_dim: tokens 的 embedding 维度
-        pool_size: adaptive pool 输出 (ph, pw) -> ph*pw tokens
+        fuse_channels: Number of channels used for fusion
+        embed_dim: Embedding dimension of the tokens
+        pool_size: Adaptive pooling output size (ph, pw), producing ph*pw tokens
         """
         super().__init__()
 
@@ -176,8 +176,8 @@ class ResNet_Fuse_L2(nn.Module):
         self.th_layer1 = base_th.layer1
         self.th_layer2 = base_th.layer2
 
-        # ------------------ thermal pre-enhance block (小卷积增强对比度) ------------------
-        # 目的是在进入 backbone 前提升 thermal 的局部对比度/纹理信息
+        # ------------------ Thermal pre-enhancement block (small convolutions to improve contrast) ------------------
+        # Improves local contrast and texture information in the thermal input before the backbone
         self.th_pre = nn.Sequential(
             nn.Conv2d(1, 16, kernel_size=3, padding=1, bias=True),
             nn.ReLU(inplace=True),
@@ -185,8 +185,8 @@ class ResNet_Fuse_L2(nn.Module):
             # don't put strong normalization here; keep it learnable
         )
 
-        # ------------------ thermal shallow decoder (deep supervision head) ------------------
-        # 从 ft2 ([B,512,H/8,W/8]) 解码到原图分辨率 [B,1,H,W]
+        # ------------------ Thermal shallow decoder (deep supervision head) ------------------
+        # Decodes ft2 ([B,512,H/8,W/8]) to the original image resolution [B,1,H,W]
         self.th_decoder = nn.Sequential(
             nn.Conv2d(512, 128, kernel_size=3, padding=1),
             nn.BatchNorm2d(128),
@@ -200,15 +200,15 @@ class ResNet_Fuse_L2(nn.Module):
             nn.ConvTranspose2d(32, 1, kernel_size=2, stride=2),  # 1/2 -> 1
         )
 
-        # ------------------ Fusion 模块（你的自定义频域融合）------------------
-        # 注意：fusion channels 要与 projection 输出一致
-        # 这里假设 UltimateFrequencyFusionV3 接受 channels=512 并返回 [B,512,H/8,W/8]
+        # ------------------ Fusion module (custom frequency-domain fusion) ------------------
+        # The fusion channel count must match the projection output
+        # Assumes UltimateFrequencyFusionV3 accepts channels=512 and returns [B,512,H/8,W/8]
         self.fusion = UltimateFrequencyFusionV3(
             channels=512,
             disable_deformable_alignment=disable_deformable_alignment,
         )
 
-        # ------------------ 后续深层 & decoder & tokens head ------------------
+        # ------------------ Subsequent deep layers, decoder, and token head ------------------
         self.decoder = DeepDecoder(in_ch=2048, mid_ch=256, out_ch=1)
         self.pool = nn.AdaptiveAvgPool2d(pool_size)
         self.embed_proj = nn.Linear(2048, embed_dim)
@@ -225,9 +225,9 @@ class ResNet_Fuse_L2(nn.Module):
 
     def forward_th_early(self, x_th):
         """
-        thermal 单通道 early forward: pre-enhance -> stem -> layer1 -> layer2
-        输入 x_th: [B,1,H,W]
-        输出: ft2: [B,512,H/8,W/8]
+        Single-channel thermal early forward: pre-enhancement -> stem -> layer1 -> layer2
+        Input x_th: [B,1,H,W]
+        Output ft2: [B,512,H/8,W/8]
         """
         # 1) per-sample spatial normalization (keep contrast but standardize scale)
         b, c, h, w = x_th.shape
